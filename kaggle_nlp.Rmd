@@ -1,0 +1,212 @@
+---
+title: "kaggle"
+author: "Zoloeva Alana"
+date: "22 12 2020"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = F) #echo true is to not have warning messages
+```
+
+Загрузим данные.
+
+```{r, message = FALSE}
+library(readr)
+library(tidytext)
+library(textdata)
+library(tidyverse)
+library(caret)
+library(data.table)
+library(superml)
+test_orig = read.csv("test.csv")
+test_orig$text = as.character(test_orig$text)
+train_orig = read.csv("train.csv")
+train_orig$text = as.character(train_orig$text)
+sample = read.csv("sample_submission.csv")
+data <- bind_rows(train_orig, test_orig)
+```
+
+Очистим данные от стопслов, цифр и пунктуации при помощи tidytext.
+```{r, message = FALSE}
+# делим на слова
+words = data %>%
+  unnest_tokens(words, text)
+
+# удаляем стоп-слова
+stopwords = data.frame(words=c(stopwords::stopwords("en"), "t.co","http","https","û_","amp","2","3","rt"), stringsAsFactors=FALSE)
+words = words %>%
+  anti_join(stopwords)
+
+# считаем частоты
+words_count = words %>%
+  dplyr::count(words, sort = TRUE) %>%
+  ungroup()
+
+words$numbers = str_detect(words$words,"[0-9]")
+words$punct = str_detect(words$words,"[[:punct:]]")
+words = words %>% filter(numbers == F)%>% filter(punct == F)
+
+clean_text = words %>% select(id, words) %>% group_by(id) %>% summarise(words = paste(words, collapse = " "))
+data = data %>% left_join(clean_text)
+```
+
+Разделим выборку на тестовую и обучающую.
+```{r,message = FALSE}
+data = data %>% filter(!is.na(words))
+set.seed(100)
+ind = createDataPartition(data$id, p = 0.2, list = F)
+train = data[-ind,]
+test = data[ind,]
+```
+
+
+Воспользуемся библиотекой superml, чтобы выделить 15 главных слов.
+```{r}
+# initialise the class
+cfv <- CountVectorizer$new(max_features = 15, remove_stopwords = T)
+
+# we fit on train data
+cfv$fit(train$words)
+
+train_cf_features <- cfv$transform(train$words)
+test_cf_features <- cfv$transform(test$words)
+```
+
+
+Попробуем построить логистическую регрессию.
+```{r}
+da = cbind(train,as.data.frame(train_cf_features))
+net = cbind(test,as.data.frame(test_cf_features))
+dante = bind_rows(da, net)
+da = da %>% filter(!is.na(target))
+
+net$location = as.factor(net$location)
+net$text = as.factor(net$text)
+da$location = as.factor(da$location)
+da$text = as.factor(da$text)
+da$words = as.factor(da$words)
+net$words = as.factor(net$words)
+da$target = as.factor(da$target)
+net$target = as.factor(net$target)
+model.log = train(target~.-id-location-keyword-text-words, data = da, method = "glm")
+
+
+
+model.log$xlevels[["location"]] <- union(model.log$xlevels[["location"]],levels(net$location))
+model.log$xlevels[["text"]] <- union(model.log$xlevels[["text"]],levels(net$text))
+model.log$xlevels[["words"]] <- union(model.log$xlevels[["words"]],levels(net$words))
+
+
+predTrain.log = predict(model.log, da, type = "raw")
+predTest.log = predict(model.log, net, type = "raw")
+
+accuracyTrain.log = confusionMatrix(predTrain.log, as.factor(da$target), positive = "1")
+accuracyTest.log = confusionMatrix(predTest.log, net$target, positive = "1")
+accuracyTrain.log$byClass["F1"]
+accuracyTest.log$byClass["F1"]
+
+```
+Посмотрим, можно ли повысить F1.
+
+Модель 2 - применим random search, когда из нескольких RF выбирается самая оптимальная.
+```{r}
+rf <- RFTrainer$new()
+rst <- RandomSearchCV$new(trainer = rf,
+                             parameters = list(n_estimators = c(10,50), max_depth = c(5,2)),
+                             n_folds = 3,
+                             scoring = 'accuracy',
+                             n_iter = 3)
+rst$fit(da, "target")
+
+rst$best_iteration()
+```
+Полученная accuracy - 0.6899893.
+
+Теперь построим RF с такими параметрами.
+```{r}
+rf <- RFTrainer$new(n_estimators = 50, max_depth = 2)
+rf$fit(X = da, y = "target")
+pred_test <- rf$predict(df = net)
+pred_train <- rf$predict(df = da)
+
+
+accuracyTrain.rf = confusionMatrix(pred_train, da$target, positive = "1")
+accuracyTest.rf = confusionMatrix(pred_test, net$target, positive = "1")
+accuracyTrain.rf$byClass["F1"]
+accuracyTest.rf$byClass["F1"]
+```
+
+F1 значительно улучшилась.
+Отправим результат в Kaggle.
+
+```{r, message = FALSE}
+testik = filter(dante, id %in% test_orig$id)
+pred_test <- rf$predict(df = testik)
+testik$target = pred_test
+testik = testik %>% select(id,target)
+filik = sample %>% select(-target) %>% left_join(testik)
+
+write_csv(filik, "filik.csv")
+```
+F1 = 0.63683, 1166 место
+
+
+Дополнительно проведём анализ, используя sentiment dictionary afinn. Если в твите не будет ни одного слова из словаря, присвоим ему нулевое значение.
+```{r, message = FALSE}
+sentdict = get_sentiments("afinn")
+sentdict$words = sentdict$word
+words_sentim = words %>% inner_join(sentdict)
+```
+
+```{r}
+length(unique(words_sentim$id))
+```
+
+```{r, message = FALSE}
+words_sentim_count = words_sentim %>% 
+  dplyr::group_by(id) %>% 
+  dplyr::summarise(sentim = mean(value)) #посчитаем
+
+data = data %>% left_join(words_sentim_count) 
+data$sentim = ifelse(is.na(data$sentim), 0, data$sentim)
+train_sentim = data[-ind,]
+test_sentim = data[ind,]
+```
+
+Применим RF для полученных данных.
+```{r, message=FALSE}
+train_sentim$target = as.factor(train_sentim$target)
+test_sentim$target = as.factor(test_sentim$target)
+train_sentim2 = train_sentim %>% filter(!is.na(target))
+library(randomForest)
+set.seed(1)
+model.rf=randomForest(target~sentim,data=train_sentim2, mtry=5, importance=TRUE)
+predTrain.rf = predict(model.rf, train_sentim)
+predTest.rf = predict(model.rf, test_sentim)
+
+```
+
+```{r}
+accuracyTrain.rf = confusionMatrix(predTrain.rf, train_sentim$target, positive = "1")
+accuracyTest.rf = confusionMatrix(predTest.rf, test_sentim$target, positive = "1")
+accuracyTrain.rf$byClass["F1"]
+accuracyTest.rf$byClass["F1"]
+```
+
+Полученная F1 ниже, чем предыдущим способом, но всё ещё неплохая.
+
+
+Отправив это в Kaggle,я получила F1 = 0.60312,но это не лучший результат, поэтому предыдущий лучше.
+
+```{r, message=FALSE}
+test1 = test_orig %>% left_join(data)
+predTest.rf = predict(model.rf, test1)
+
+test1$target = predTest.rf
+test1 = test1 %>% select(id, target)
+nu = sample %>% select(-target) %>% left_join(test1) 
+
+
+write_csv(nu, "nu.csv")
+```
+
