@@ -1,0 +1,136 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_float: true
+---
+
+Загрузим данные и посмотрим на них.
+```{r, warning = FALSE, message=FALSE}
+library(readr)
+library(mice)
+library(VIM)
+library(lattice)
+library(caret)
+library(gbm)
+library(randomForest)
+library(dplyr)
+raw <- read.csv("train.csv", stringsAsFactors=TRUE)
+str(raw)
+```
+
+Необходимо отобрать переменные, которые будут использоваться для предсказания, потому что 81 переменная это слишком много.
+
++ SalePrice  
++ MSSubClass  
++ LotArea  
++ LotShape  
++ OverallQual  
++ OverallCond  
++ YearBuilt  
++ YearRemodAdd  
++ GrLivArea  
++ FullBath  
++ BedroomAbvGr  
++ TotRmsAbvGrd  
++ Fence  
++ Alley  
++ MSZoning  
++ LandContour  
++ Heating  
++ CentralAir  
++ GarageType  
++ Electrical  
++ BsmtCond
+
+
+Мне показалось логичным выбрать переменные, описывающие внешний вид и качество дома, участок, район, различные удобства, доступные в нём.
+
+Разделим выборку на тестовую и обучающую.
+```{r, message=FALSE, warning = FALSE}
+set.seed(100)
+raw$id <- seq.int(nrow(raw))
+ind = createDataPartition(raw$SalePrice, p = 0.15, list = F)
+houses.train = raw[-ind,]
+houses.test = raw[ind,]
+```
+
+Отберём нужные переменные.
+```{r, message=FALSE, warning = FALSE}
+houses.sel = raw %>% select(id,SalePrice,MSSubClass,LotArea,LotShape,OverallQual,OverallCond,YearBuilt,YearRemodAdd,GrLivArea,FullBath,BedroomAbvGr,TotRmsAbvGrd,Fence,Alley,MSZoning,LandContour,Heating,CentralAir,GarageType,Electrical,BsmtCond)
+houses.train = houses.train %>% filter(!is.na(Electrical))
+houses.sel = houses.sel %>% filter(!is.na(Electrical))
+```
+
+Посмотрим, надо ли проводить imputing.
+```{r, warning = FALSE}
+md.pattern(houses.sel)
+```
+
+
+Да, в переменных Fence, Alley, GarageType, BsmtCond есть много пропущенных данных.
+
+```{r, message=FALSE, warning = FALSE, results = "hide"}
+mice_imputes = mice(houses.sel, m=5, maxit = 20)
+```
+
+Заполним пропуски в данных.
+```{r, message=FALSE, warning = FALSE}
+Imputed_data=complete(mice_imputes,5)
+for (i in 206:221)
+  {ind[i,] = ind[i,]+1}
+houses.imp.test = Imputed_data[ind,]
+houses.imp.train = Imputed_data[-ind,]
+```
+
+### Регрессия
+```{r, warning = FALSE}
+model1 = lm(log(SalePrice)~., data = houses.imp.train)
+
+pred1 = predict(model1, houses.imp.test)
+
+rmse <- mean((pred1 - log(houses.imp.test$SalePrice))^2)^(1/2)
+rmse
+```
+RMSE довольно высокий, попробуем другие методы.
+
+### RandomForest
+
+Для RF возьмём mtry по умолчанию.
+
+```{r, message=FALSE, warning = FALSE}
+set.seed(1)
+model.rf=randomForest(log(SalePrice)~MSSubClass+LotArea+LotShape+OverallQual+OverallCond+YearBuilt+YearRemodAdd+GrLivArea+FullBath+BedroomAbvGr+TotRmsAbvGrd+Fence+Alley+MSZoning+LandContour+Heating+CentralAir+BsmtCond,data=houses.imp.train, mtry=5, importance = T)
+predTest.rf = predict(model.rf, houses.imp.test)
+rmse.rf <- mean((predTest.rf - log(houses.imp.test$SalePrice))^2)^(1/2)
+rmse.rf
+```
+
+0.1612716
+Лучше, но попробуем другую модель.
+
+### Бустинг
+Необходимо установить параметр distribution = "gaussian", так как это задача регрессии, interaction.depth=4, так как есть шанс повысить accuracy, и n.trees=5000.
+
+```{r,warning = FALSE}
+set.seed(1)
+model.boost=gbm(log(SalePrice)~MSSubClass+LotArea+LotShape+OverallQual+OverallCond+YearBuilt+YearRemodAdd+GrLivArea+FullBath+BedroomAbvGr+TotRmsAbvGrd+Fence+Alley+MSZoning+LandContour+Heating+CentralAir+GarageType+Electrical+BsmtCond, data=houses.imp.train, distribution="gaussian", n.trees=5000, interaction.depth=4)
+predboost = predict(model.boost,houses.imp.test)
+rmse.boost <- mean((predboost - log(houses.imp.test$SalePrice))^2)^(1/2)
+rmse.boost
+```
+
+Получилась ошибка 0.1539635, это самый лучший вариант.
+
+Подготовим файл для Kaggle.
+```{r, warning = FALSE}
+real_test <- read.csv("test.csv")
+real_log_predict <- predict(model.boost, real_test)
+to_send_log <- data.frame(Id=real_test$Id, SalePrice = exp(real_log_predict))
+write_csv(to_send_log, "to_send_log_final.csv")
+```
+
+
+На Kaggle она составляет 0.15944 - 3157 место на leaderboard.
